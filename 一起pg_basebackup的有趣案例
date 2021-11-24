@@ -1,0 +1,417 @@
+## 前言
+
+最近几个月一直在和备份打交道，之前备份导致的生产故障至今印象还尤为深刻。
+
+今天线上一位同事又找到我，说通过pg_basebackup备份下来的库启动报错，又是备份这个老秃驴！
+
+## 背景
+
+众所周知，平安作为国内目前最大的PostgreSQL用户，实例数已经突破7000+了，不仅量大，版本跨度也大（最老的v9.4，最新的v13），由于历史原因，目前大致的备份规则是
+
+1. v9.4的库使用pg_rman进行备份恢复，pg_rman跑的不是流复制协议，而是文件拷贝，所以pg_rman必须和数据库节点跑在一起，这算一个小小的缺点
+2. v9.5的库使用pg_basebackup进行备份
+3. v9.6以上的库使用pg_probackup进行备份，pg_probackup社区版的寻址地址最大4GB，所以假如segment size超过了4GB，备份是无效的，基于此，我们内部修改了这部分的代码，支持更大的寻址空间
+4. v13版本的库使用pg_backrest进行备份
+
+目前小于9.6的库正在逐步迁移升级上云中，但是还有不少存量的 9.4 和 9.5的库。
+
+## pg_basebackup
+
+今天有问题的是pg_basebackup备份下来的库，pg_basebackup本质上就是封装的pg_start_backup()和pg_stop_backup()，并且是non-exclusive backup，即非排它式备份。
+
+使用pg_basebackup主要需要注意 -X参数的使用，即指定以何种方式处理备份过程中产生的WAL日志。
+
+~~~shell
+  -X, --wal-method=none|fetch|stream
+                         include required WAL files with specified method
+~~~
+
+目前提供了串行备份（fetch）和并行备份（stream）的方式。fetch模式需要保证在备份数据的过程中，备份开始时刻的日志需要一直保存下来， 也就是说wal_keep_segments得配置足够大以保留日志文件，如果备份数据期间，日志开始时刻的日志已经被移除，那么备份就会失败。而stream模式，是默认的模式，要求wal_max_sender参数不小于2，因为会额外启动一个wal sender进程发送WAL日志，但stream模式不支持，将数据和日志以流的方式输出到标准输出。none的话则代表有DBA自行处理。
+
+了解了原理之后，我们来看下效果
+
+### v13
+
+~~~shell
+[postgres@xiongcc ~]$ pg_basebackup -Fp -D mybasebackup -P -v 
+pg_basebackup: initiating base backup, waiting for checkpoint to complete
+pg_basebackup: checkpoint completed
+pg_basebackup: write-ahead log start point: 0/8D000028 on timeline 1
+pg_basebackup: starting background WAL receiver
+pg_basebackup: created temporary replication slot "pg_basebackup_28209"
+26904/26904 kB (100%), 1/1 tablespace                                         
+pg_basebackup: write-ahead log end point: 0/8D000100
+pg_basebackup: waiting for background process to finish streaming ...
+pg_basebackup: syncing data to disk ...
+pg_basebackup: renaming backup_manifest.tmp to backup_manifest
+pg_basebackup: base backup completed
+
+[postgres@xiongcc ~]$ ls -l mybasebackup/
+total 272
+-rw------- 1 postgres postgres    227 Nov 23 22:32 backup_label
+-rw------- 1 postgres postgres 139713 Nov 23 22:32 backup_manifest
+drwx------ 5 postgres postgres   4096 Nov 23 22:32 base
+-rw------- 1 postgres postgres     30 Nov 23 22:32 current_logfiles
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 global
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 log
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_commit_ts
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_dynshmem
+-rw------- 1 postgres postgres   4789 Nov 23 22:32 pg_hba.conf
+-rw------- 1 postgres postgres   1636 Nov 23 22:32 pg_ident.conf
+drwx------ 4 postgres postgres   4096 Nov 23 22:32 pg_logical
+drwx------ 4 postgres postgres   4096 Nov 23 22:32 pg_multixact
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_notify
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_replslot
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_serial
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_snapshots
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_stat
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_stat_tmp
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_subtrans
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_tblspc
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_twophase
+-rw------- 1 postgres postgres      3 Nov 23 22:32 PG_VERSION
+drwx------ 3 postgres postgres   4096 Nov 23 22:32 pg_wal
+drwx------ 2 postgres postgres   4096 Nov 23 22:32 pg_xact
+-rw------- 1 postgres postgres    126 Nov 23 22:32 postgresql.auto.conf
+-rw------- 1 postgres postgres  29911 Nov 23 22:32 postgresql.conf
+~~~
+
+改了端口之后（因为实例均在同一台主机上），即可顺利启动
+
+~~~shell
+[postgres@xiongcc ~]$ vim mybasebackup/postgresql.conf 
+[postgres@xiongcc ~]$ pg_ctl -D mybasebackup/ start
+waiting for server to start....2021-11-23 22:33:36.341 CST [28219] LOG:  redirecting log output to logging collector process
+2021-11-23 22:33:36.341 CST [28219] HINT:  Future log output will appear in directory "log".
+ done
+server started
+[postgres@xiongcc ~]$ psql -p 5477
+psql (14rc1)
+Type "help" for help.
+
+postgres=#
+~~~
+
+pg_basebackup会生成一个backup_label文件，里面的信息和控制文件里记录的是一致的
+
+~~~shell
+[postgres@xiongcc ~]$ rm -rf mybasebackup/*
+[postgres@xiongcc ~]$ pg_basebackup -Fp -D mybasebackup -P -v 
+pg_basebackup: initiating base backup, waiting for checkpoint to complete
+pg_basebackup: checkpoint completed
+pg_basebackup: write-ahead log start point: 0/91000028 on timeline 1
+pg_basebackup: starting background WAL receiver
+pg_basebackup: created temporary replication slot "pg_basebackup_28278"
+26904/26904 kB (100%), 1/1 tablespace                                         
+pg_basebackup: write-ahead log end point: 0/91000100
+pg_basebackup: waiting for background process to finish streaming ...
+pg_basebackup: syncing data to disk ...
+pg_basebackup: renaming backup_manifest.tmp to backup_manifest
+pg_basebackup: base backup completed
+
+[postgres@xiongcc ~]$ cat mybasebackup/backup_label 
+START WAL LOCATION: 0/91000028 (file 000000010000000000000091)
+CHECKPOINT LOCATION: 0/91000060
+BACKUP METHOD: streamed
+BACKUP FROM: primary
+START TIME: 2021-11-23 22:37:09 CST
+LABEL: pg_basebackup base backup
+START TIMELINE: 1
+
+[postgres@xiongcc ~]$ pg_controldata -D mybasebackup/ | grep checkpoint
+Latest checkpoint location:           0/91000060
+Latest checkpoint's REDO location:    0/91000028
+Latest checkpoint's REDO WAL file:    000000010000000000000091
+Latest checkpoint's TimeLineID:       1
+Latest checkpoint's PrevTimeLineID:   1
+Latest checkpoint's full_page_writes: on
+Latest checkpoint's NextXID:          0:904
+Latest checkpoint's NextOID:          16527
+Latest checkpoint's NextMultiXactId:  1
+Latest checkpoint's NextMultiOffset:  0
+Latest checkpoint's oldestXID:        726
+Latest checkpoint's oldestXID's DB:   1
+Latest checkpoint's oldestActiveXID:  904
+Latest checkpoint's oldestMultiXid:   1
+Latest checkpoint's oldestMulti's DB: 1
+Latest checkpoint's oldestCommitTsXid:0
+Latest checkpoint's newestCommitTsXid:0
+Time of latest checkpoint:            Tue 23 Nov 2021 10:37:09 PM CST
+~~~
+
+所以move掉，直接启动也没问题。
+
+其实论原理，更准确一点的说，PostgreSQL正常停止启动的话，若发现了backup_label，会自动改为backup_label.old，不信你可以自己在数据目录下touch一个backup_label，然后正常停止启动，你就会发现变成了backup_label.old。
+
+~~~shell
+[postgres@xiongcc ~]$ mv mybasebackup/backup_label mybasebackup/backup_label_bak
+[postgres@xiongcc ~]$ vim mybasebackup/postgresql.conf 
+[postgres@xiongcc ~]$ pg_ctl -D mybasebackup/ start
+waiting for server to start....2021-11-23 22:51:01.603 CST [28314] LOG:  redirecting log output to logging collector process
+2021-11-23 22:51:01.603 CST [28314] HINT:  Future log output will appear in directory "log".
+ done
+server started
+~~~
+
+### v9.5.5
+
+生产环境是9.5.5的，那么使用同样的环境再试一次，先正常模拟点写入
+
+~~~shell
+[postgres@xiongcc ~]$ psql -p 5455
+psql (9.5.5)
+Type "help" for help.
+
+postgres=# select version();
+                                                 version                                                  
+----------------------------------------------------------------------------------------------------------
+ PostgreSQL 9.5.5 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 4.8.5 20150623 (Red Hat 4.8.5-44), 64-bit
+(1 row)
+
+postgres=# create table test(id int);
+CREATE TABLE
+postgres=# insert into test values(generate_series(1,100000));
+INSERT 0 100000
+postgres=# select pg_switch_xlog();
+ pg_switch_xlog 
+----------------
+ 0/1DDEE18
+(1 row)
+
+postgres=# checkpoint ;
+CHECKPOINT
+postgres=# insert into test values(generate_series(1,100000));
+INSERT 0 100000
+postgres=# select pg_switch_xlog();
+ pg_switch_xlog 
+----------------
+ 0/26201C0
+(1 row)
+
+postgres=# checkpoint ;
+CHECKPOINT
+postgres=# \q
+~~~
+
+然后使用pg_basebackup进行备份
+
+~~~shell
+[postgres@xiongcc ~]$ pg_basebackup -Fp -D mybasebackup_95 -P -v -p 5455
+29473/29473 kB (100%), 1/1 tablespace                                         
+NOTICE:  WAL archiving is not enabled; you must ensure that all required WAL segments are copied through other means to complete the backup
+pg_basebackup: base backup completed
+~~~
+
+老样子依葫芦画瓢启动，报错了，提示得删除backup_label
+
+~~~shell
+[postgres@xiongcc ~]$ pg_basebackup -Fp -D mybasebackup_95 -P -v -p 5455
+29614/29614 kB (100%), 1/1 tablespace                                         
+NOTICE:  WAL archiving is not enabled; you must ensure that all required WAL segments are copied through other means to complete the backup
+pg_basebackup: base backup completed
+[postgres@xiongcc ~]$ vim mybasebackup_95/postgresql.conf 
+[postgres@xiongcc ~]$ pg_ctl -D mybasebackup_95/ start
+server starting
+[postgres@xiongcc ~]$ LOG:  could not bind IPv6 socket: Cannot assign requested address
+HINT:  Is another postmaster already running on port 54555? If not, wait a few seconds and retry.
+LOG:  redirecting log output to logging collector process
+HINT:  Future log output will appear in directory "log".
+
+[postgres@xiongcc ~]$ cat mybasebackup_95/log/postgresql-Tue.log 
+LOG:  database system was interrupted; last known up at 2021-11-23 23:15:39 CST
+LOG:  invalid checkpoint record
+FATAL:  could not locate required checkpoint record
+HINT:  If you are not restoring from a backup, try removing the file "/home/postgres/mybasebackup_95/backup_label".
+LOG:  startup process (PID 4524) exited with exit code 1
+LOG:  aborting startup due to startup process failure
+~~~
+
+删除之后再启动一次，依旧提示检查点记录无效，这里需要注意的是，在v11以前的版本，控制文件里还会额外存储一个 piror checkpoint record。
+
+~~~shell
+[postgres@xiongcc ~]$ mv mybasebackup_95/backup_label mybasebackup_95/backup_label_bak
+[postgres@xiongcc ~]$ pg_ctl -D mybasebackup_95/ start
+server starting
+[postgres@xiongcc ~]$ LOG:  could not bind IPv6 socket: Cannot assign requested address
+HINT:  Is another postmaster already running on port 54555? If not, wait a few seconds and retry.
+LOG:  redirecting log output to logging collector process
+HINT:  Future log output will appear in directory "log".
+
+[postgres@xiongcc ~]$ cat mybasebackup_95/log/postgresql-Tue.log 
+LOG:  database system was interrupted; last known up at 2021-11-23 23:15:39 CST
+LOG:  invalid primary checkpoint record
+LOG:  invalid secondary checkpoint record
+PANIC:  could not locate a valid checkpoint record
+LOG:  startup process (PID 4533) was terminated by signal 6: Aborted
+LOG:  aborting startup due to startup process failure
+~~~
+
+这种时候，根据提示信息`invalid primary checkpoint record`，网上一搜都会提示你使用pg_resetwal进行重置控制文件，但是可能会丢数据，不到万不得已，我是不喜欢这么操作的。
+
+那么为什么会这样呢？根据提示信息看一下
+
+>NOTICE:  WAL archiving is not enabled; you must ensure that all required WAL segments are copied through other means to complete the backup
+
+提示因为未开启归档，那么你得手动拷贝这期间需要的WAL日志，以确保备份完整
+
+~~~shell
+[postgres@xiongcc ~]$ rm -rf mybasebackup_95/*
+[postgres@xiongcc ~]$ pg_basebackup -Fp -D mybasebackup_95 -P -v -p 5455
+29614/29614 kB (100%), 1/1 tablespace                                         
+NOTICE:  WAL archiving is not enabled; you must ensure that all required WAL segments are copied through other means to complete the backup
+pg_basebackup: base backup completed
+
+[postgres@xiongcc ~]$ ll mybasebackup_95/pg_xlog/
+total 4
+drwx------ 2 postgres postgres 4096 Nov 23 23:22 archive_status
+~~~
+
+果然pg_xlog下没有将WAL日志拷贝过来
+
+但是v13的版本拷贝了，所以可以正常启动了。
+
+~~~shell
+[postgres@xiongcc ~]$ rm -rf mybasebackup/*
+[postgres@xiongcc ~]$ pg_basebackup -Fp -D mybasebackup -P -v
+pg_basebackup: initiating base backup, waiting for checkpoint to complete
+pg_basebackup: checkpoint completed
+pg_basebackup: write-ahead log start point: 0/93000028 on timeline 1
+pg_basebackup: starting background WAL receiver
+pg_basebackup: created temporary replication slot "pg_basebackup_4589"
+26904/26904 kB (100%), 1/1 tablespace                                         
+pg_basebackup: write-ahead log end point: 0/93000100
+pg_basebackup: waiting for background process to finish streaming ...
+pg_basebackup: syncing data to disk ...
+pg_basebackup: renaming backup_manifest.tmp to backup_manifest
+pg_basebackup: base backup completed
+[postgres@xiongcc ~]$ ll mybasebackup/pg_wal/
+total 16388
+-rw------- 1 postgres postgres 16777216 Nov 23 23:26 000000010000000000000093
+drwx------ 2 postgres postgres     4096 Nov 23 23:26 archive_status
+~~~
+
+后面一阵分析，发现原来是9.5版本的pg_basebackup默认不处理备份期间的WAL日志，那么手动指定一下`-Xs`看看
+
+~~~shell
+[postgres@xiongcc ~]$ pg_basebackup -Fp -Xs -D mybasebackup_95 -P -v -p 5455
+transaction log start point: 0/C000028 on timeline 1
+pg_basebackup: starting background WAL receiver
+29614/29614 kB (100%), 1/1 tablespace                                         
+transaction log end point: 0/C0000F8
+pg_basebackup: waiting for background process to finish streaming ...
+pg_basebackup: base backup completed
+[postgres@xiongcc ~]$ ll mybasebackup_95/pg_xlog/
+total 16388
+-rw------- 1 postgres postgres 16777216 Nov 23 23:28 00000001000000000000000C
+drwx------ 2 postgres postgres     4096 Nov 23 23:28 archive_status
+~~~
+
+再次启动就正常了
+
+~~~shell
+[postgres@xiongcc ~]$ vim mybasebackup_95/postgresql.conf 
+[postgres@xiongcc ~]$ pg_ctl -D mybasebackup_95/ start
+server starting
+[postgres@xiongcc ~]$ LOG:  could not bind IPv6 socket: Cannot assign requested address
+HINT:  Is another postmaster already running on port 54555? If not, wait a few seconds and retry.
+LOG:  redirecting log output to logging collector process
+HINT:  Future log output will appear in directory "log".
+
+[postgres@xiongcc ~]$ psql -p 54555
+psql (9.5.5)
+Type "help" for help.
+
+postgres=# \q
+~~~
+
+当然你也可以配置归档，并且这次会提示`pg_stop_backup complete, all required WAL segments have been archived`
+
+~~~shell
+[postgres@xiongcc ~]$ rm -rf mybasebackup_95/*
+[postgres@xiongcc ~]$ ll archive_dir/*
+-rw------- 1 postgres postgres 16777216 Nov 23 23:38 archive_dir/00000001000000000000000D
+-rw------- 1 postgres postgres 16777216 Nov 23 23:38 archive_dir/00000001000000000000000E
+-rw------- 1 postgres postgres      302 Nov 23 23:38 archive_dir/00000001000000000000000E.00000028.backup
+-rw------- 1 postgres postgres 16777216 Nov 23 23:45 archive_dir/00000002000000000000000F
+-rw------- 1 postgres postgres       41 Nov 23 23:40 archive_dir/00000002.history
+
+[postgres@xiongcc ~]$ pg_basebackup -Fp -D mybasebackup_95 -P -v -p 5455
+29614/29614 kB (100%), 1/1 tablespace                                         
+NOTICE:  pg_stop_backup complete, all required WAL segments have been archived
+pg_basebackup: base backup completed
+
+[postgres@xiongcc ~]$ ll archive_dir/
+total 81932
+-rw------- 1 postgres postgres 16777216 Nov 23 23:38 00000001000000000000000D
+-rw------- 1 postgres postgres 16777216 Nov 23 23:38 00000001000000000000000E
+-rw------- 1 postgres postgres      302 Nov 23 23:38 00000001000000000000000E.00000028.backup
+-rw------- 1 postgres postgres 16777216 Nov 23 23:46 00000001000000000000000F
+-rw------- 1 postgres postgres 16777216 Nov 23 23:46 000000010000000000000010
+-rw------- 1 postgres postgres      305 Nov 23 23:46 000000010000000000000010.00000028.backup
+-rw------- 1 postgres postgres 16777216 Nov 23 23:45 00000002000000000000000F
+-rw------- 1 postgres postgres       41 Nov 23 23:40 00000002.history
+~~~
+
+最新的000000010000000000000010.00000028.backup意味着，基于此次的全备，早于000000010000000000000010的WAL日志都不再需要了。
+
+配置了归档和recovery.conf之后，可以看到，启动的时候，如前面分析，从归档目录里找了000000010000000000000010。
+
+~~~shell
+[postgres@xiongcc ~]$ cat mybasebackup_95/recovery.conf
+restore_command='cp /home/postgres/archive_dir/%f %p'
+[postgres@xiongcc ~]$ vim mybasebackup_95/postgresql.conf 
+[postgres@xiongcc ~]$ pg_ctl -D mybasebackup_95/ start
+server starting
+[postgres@xiongcc ~]$ LOG:  could not bind IPv6 socket: Cannot assign requested address
+HINT:  Is another postmaster already running on port 54555? If not, wait a few seconds and retry.
+LOG:  redirecting log output to logging collector process
+HINT:  Future log output will appear in directory "log".
+
+[postgres@xiongcc ~]$ psql -p 54555
+psql (9.5.5)
+Type "help" for help.
+
+postgres=# \q
+[postgres@xiongcc ~]$ cat mybasebackup_95/log/postgresql-Tue.log 
+LOG:  database system was interrupted; last known up at 2021-11-23 23:46:18 CST
+LOG:  starting archive recovery
+LOG:  restored log file "000000010000000000000010" from archive
+LOG:  redo starts at 0/10000028
+LOG:  consistent recovery state reached at 0/100000F8
+cp: cannot stat ‘/home/postgres/archive_dir/000000010000000000000011’: No such file or directory
+LOG:  redo done at 0/100000F8
+LOG:  restored log file "000000010000000000000010" from archive
+LOG:  restored log file "00000002.history" from archive
+cp: cannot stat ‘/home/postgres/archive_dir/00000003.history’: No such file or directory
+LOG:  selected new timeline ID: 3
+cp: cannot stat ‘/home/postgres/archive_dir/00000001.history’: No such file or directory
+LOG:  archive recovery complete
+LOG:  MultiXact member wraparound protections are now enabled
+LOG:  database system is ready to accept connections
+LOG:  autovacuum launcher started
+~~~
+
+## 一探究竟
+
+官网上写的很明白了，除非指定none，默认可以不依赖归档直接启动，而9.5（9.6以下的库）默认就是none，所以无法直接启动。
+
+>Includes the required write-ahead log files (WAL files) in the backup. This will include all write-ahead logs generated during the backup. Unless the method `none` is specified, it is possible to start a postmaster directly in the extracted directory without the need to consult the log archive, thus making this a completely standalone backup.
+>
+>在备份中包括所需的预写式日志文件（WAL文件）。这包括所有在备份期间产生的预写式日志。除非指定了方法none，那么可以直接在提取出的目录中启动postmaster而无需参考日志归档，所以这样得到的是一种完整的独立备份。 
+
+而在v9.5的版本中，默认不指定，需要手动指定或者指定归档目录，所以pg_wal目录下没有任何的WAL日志
+
+![image-20211123233202466](C:\Users\xiongcc\AppData\Roaming\Typora\typora-user-images\image-20211123233202466.png)
+
+而v9.6以后的版本中，默认会以stream的方式处理备份期间产生的WAL日志。
+
+![image-20211123233253441](C:\Users\xiongcc\AppData\Roaming\Typora\typora-user-images\image-20211123233253441.png)
+
+## 小结
+
+真是一段糟糕的踩坑记录，现有的自动化脚本里面pg_basebackup并未显式指定如何处理备份期间的WAL日志，那么对于9.6以前的库，倘若需要恢复一个时间较早之前的备份，你得手动配置recovery.conf并指定restore_command，再忍受慢吞吞的拷贝与回放
+
+版本差异带来的坑。又是一堆自动化脚本的修改与下发......
+
+所以，尽早升级版本还是十分之重要的，尤其是9.6随着14大版本的发布已经EOL了！
+
